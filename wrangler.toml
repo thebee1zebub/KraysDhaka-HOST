@@ -14,10 +14,10 @@ not_found_handling = "single-page-application"
 [[d1_databases]]
 binding = "DB"
 database_name = "kraysdhaka-db"
-database_id = "PLACEHOLDER_D1_DATABASE_ID"
+database_id = "bab4ac60-15d0-4ef3-bbf3-2235f8d1fc68"
 
 # Cloudflare R2 Object Storage for Garment Photography Assets
 # Create with: wrangler r2 bucket create kraysdhaka-images
 [[r2_buckets]]
 binding = "IMAGES"
-bucket_name = "kraysdhaka-images"
+bucket_name = "krays-dhaka-products"
