@@ -3,7 +3,15 @@
  */
 import { Env } from './types';
 
-const DEFAULT_PASSCODE = 'Krays@Admin26';
+function getAuthSecret(env: Env): string {
+  const secret = env.ADMIN_API_KEY || env.ADMIN_PASSCODE;
+
+  if (!secret) {
+    throw new Error('Admin secret is not configured');
+  }
+
+  return secret;
+}
 
 /**
  * Perform constant-time string comparison to mitigate timing attacks
