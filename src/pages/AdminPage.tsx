@@ -1,30 +1,37 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Link } from '../router';
 import {
   Plus,
   Trash2,
   Edit2,
-  Download,
   RotateCcw,
   Check,
   X,
   Lock,
   ArrowLeft,
   ExternalLink,
-  Layers,
   Copy,
   AlertCircle,
   Database,
-  Eye
+  Eye,
+  RefreshCw,
+  Cloud,
+  CheckCircle2,
+  FileText,
+  Loader2
 } from 'lucide-react';
 import { useCatalog } from '../context/CatalogContext';
 import { Product, IMAGES } from '../data/tailoringData';
 import { formatBDT } from '../utils/tailoring';
 import { ImageUploadField } from '../components/ImageUploadField';
 import { formatPriceInput } from '../utils/catalogSlug';
-import { estimateLocalStorageUsage } from '../utils/imageCompressor';
-
-const ADMIN_PASSCODE = 'Krays@Admin26';
+import {
+  loginAdmin,
+  getStoredToken,
+  clearStoredToken,
+  fetchAdminProducts,
+  checkBackendHealth
+} from '../services/api';
 
 export const AdminPage: React.FC = () => {
   const {
@@ -32,26 +39,33 @@ export const AdminPage: React.FC = () => {
     addProduct,
     updateProduct,
     removeProduct,
+    toggleProductStatus,
     resetToDefault,
     exportCatalogJson,
-    storageError,
-    clearStorageError
+    refreshProducts,
+    backendHealth,
+    isRemote,
+    isLoading: isCatalogLoading
   } = useCatalog();
 
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
-    return sessionStorage.getItem('krays_admin_auth') === 'true';
+    return Boolean(getStoredToken());
   });
   const [passcode, setPasscode] = useState('');
   const [authError, setAuthError] = useState('');
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
 
   // Modal / Form state
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [itemToDelete, setItemToDelete] = useState<{ id: string; name: string } | null>(null);
   const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
-  const [formData, setFormData] = useState<Partial<Product>>({
+  // Form model
+  const [formData, setFormData] = useState<Partial<Product> & { status?: 'published' | 'draft' }>({
     name: '',
     collection: 'Essential',
     category: 'Suit',
@@ -67,24 +81,50 @@ export const AdminPage: React.FC = () => {
     buttons: 'Genuine dark horn buttons',
     image: IMAGES.essential,
     galleryImages: [IMAGES.essential],
-    features: ['Hand-finished interior lining', 'Side waist adjusters']
+    features: ['Hand-finished interior lining', 'Side waist adjusters'],
+    status: 'published'
   });
 
   const [copyFeedback, setCopyFeedback] = useState(false);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
   const [newlyCreatedId, setNewlyCreatedId] = useState<string | null>(null);
 
-  const storageUsage = estimateLocalStorageUsage();
-
-  const handleLogin = (e: React.FormEvent) => {
+  // Authenticate against server
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (passcode === ADMIN_PASSCODE) {
-      sessionStorage.setItem('krays_admin_auth', 'true');
-      setIsAuthenticated(true);
-      setAuthError('');
-    } else {
-      setAuthError('Incorrect atelier passcode.');
+    if (!passcode.trim()) {
+      setAuthError('Please enter the atelier passcode.');
+      return;
     }
+
+    setIsLoggingIn(true);
+    setAuthError('');
+
+    try {
+      const result = await loginAdmin(passcode.trim());
+      if (result.success && result.token) {
+        setIsAuthenticated(true);
+        setAuthError('');
+        await refreshProducts();
+      } else {
+        setAuthError(result.error || 'Incorrect atelier passcode.');
+      }
+    } catch (err: any) {
+      setAuthError(err.message || 'Authentication error.');
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleLogout = () => {
+    clearStoredToken();
+    setIsAuthenticated(false);
+  };
+
+  const handleManualRefresh = async () => {
+    setIsRefreshing(true);
+    await refreshProducts();
+    setIsRefreshing(false);
   };
 
   const handleOpenAdd = () => {
@@ -106,31 +146,50 @@ export const AdminPage: React.FC = () => {
       buttons: 'Horn buttons',
       image: IMAGES.essential,
       galleryImages: [IMAGES.essential],
-      features: ['Hand-finished interior lining', 'Tailored trousers']
+      features: ['Hand-finished interior lining', 'Tailored trousers'],
+      status: 'published'
     });
     setIsFormOpen(true);
   };
 
-  const handleOpenEdit = (product: Product) => {
+  const handleOpenEdit = (product: Product & { status?: 'published' | 'draft' }) => {
     setEditingId(product.id);
     setFormError(null);
     setFormData({
       ...product,
-      galleryImages: product.galleryImages || [product.image]
+      galleryImages: product.galleryImages || [product.image],
+      status: product.status || 'published'
     });
     setIsFormOpen(true);
   };
 
-  const confirmDeleteAction = () => {
-    if (!itemToDelete) return;
-    const { id, name } = itemToDelete;
-    removeProduct(id);
-    setActionSuccess(`Removed "${name}" from catalog.`);
-    setItemToDelete(null);
-    setTimeout(() => setActionSuccess(null), 3000);
+  const handleTogglePublication = async (product: Product & { status?: 'published' | 'draft' }) => {
+    const nextStatus = (product.status || 'published') === 'published' ? 'draft' : 'published';
+    try {
+      if (toggleProductStatus) {
+        await toggleProductStatus(product.id, nextStatus);
+        setActionSuccess(`Updated "${product.name}" status to ${nextStatus}.`);
+        setTimeout(() => setActionSuccess(null), 3000);
+      }
+    } catch (err: any) {
+      setFormError(err.message || 'Failed to update publication status.');
+    }
   };
 
-  const handleFormSubmit = (e: React.FormEvent) => {
+  const confirmDeleteAction = async () => {
+    if (!itemToDelete) return;
+    const { id, name } = itemToDelete;
+    try {
+      await removeProduct(id);
+      setActionSuccess(`Removed "${name}" from catalog and cleaned up R2 imagery.`);
+      setItemToDelete(null);
+      setTimeout(() => setActionSuccess(null), 4000);
+    } catch (err: any) {
+      setFormError(err.message || 'Failed to delete product.');
+    }
+  };
+
+  const handleFormSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError(null);
 
@@ -141,13 +200,13 @@ export const AdminPage: React.FC = () => {
     }
 
     if (!formData.image || !formData.image.trim()) {
-      setFormError('Please upload an image from your device or pick a photography preset.');
+      setFormError('Please upload an image to Cloudflare R2 or pick a photography preset.');
       return;
     }
 
     const cleanedPrice = formatPriceInput(formData.startingPrice);
 
-    const preparedProduct: Omit<Product, 'id'> & { id?: string } = {
+    const preparedProduct = {
       id: editingId || undefined,
       name,
       collection: formData.collection || 'Essential',
@@ -168,17 +227,20 @@ export const AdminPage: React.FC = () => {
         : [formData.image.trim()],
       features: formData.features && formData.features.length > 0
         ? formData.features
-        : ['Hand-finished interior lining', 'Bespoke canvas structure', 'Tailored trousers']
+        : ['Hand-finished interior lining', 'Bespoke canvas structure', 'Tailored trousers'],
+      status: formData.status || 'published'
     };
+
+    setIsSubmitting(true);
 
     try {
       if (editingId) {
-        updateProduct(editingId, preparedProduct);
-        setActionSuccess(`Updated garment "${name}" successfully.`);
+        await updateProduct(editingId, preparedProduct);
+        setActionSuccess(`Saved changes to "${name}" in Cloudflare D1.`);
         setNewlyCreatedId(editingId);
       } else {
-        const created = addProduct(preparedProduct);
-        setActionSuccess(`Added "${name}" to ${preparedProduct.collection} Collection!`);
+        const created = await addProduct(preparedProduct);
+        setActionSuccess(`Added "${name}" to ${preparedProduct.collection} Collection in Cloudflare D1!`);
         setNewlyCreatedId(created.id);
       }
 
@@ -186,7 +248,9 @@ export const AdminPage: React.FC = () => {
       setTimeout(() => setActionSuccess(null), 5000);
     } catch (err: any) {
       console.error('Failed to post / save garment:', err);
-      setFormError(err.message || 'Failed to save garment to storage. Please optimize image or try again.');
+      setFormError(err.message || 'Failed to save garment to database. Please verify Cloudflare D1 credentials.');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -206,13 +270,13 @@ export const AdminPage: React.FC = () => {
               <Lock className="w-5 h-5" />
             </div>
             <span className="text-[10px] tracking-[0.24em] uppercase text-[#777777] font-mono">
-              Atelier Portal
+              Atelier Edge Portal
             </span>
             <h1 className="font-editorial text-3xl text-[#111111] font-medium">
               KRAYS DHAKA Manager
             </h1>
-            <p className="text-xs text-[#666666] font-sans-ui">
-              Enter the passcode to manage garments, pricing, and collection listings.
+            <p className="text-xs text-[#666666] font-sans-ui leading-relaxed">
+              Authenticate with your atelier passcode to manage garments, pricing, and photography on Cloudflare D1 and R2.
             </p>
           </div>
 
@@ -227,8 +291,8 @@ export const AdminPage: React.FC = () => {
                 autoFocus
               />
               {authError && (
-                <p className="text-[11px] text-red-600 mt-1.5 text-center flex items-center justify-center gap-1">
-                  <AlertCircle className="w-3 h-3" />
+                <p className="text-[11px] text-red-600 mt-2 text-center flex items-center justify-center gap-1">
+                  <AlertCircle className="w-3.5 h-3.5" />
                   <span>{authError}</span>
                 </p>
               )}
@@ -236,9 +300,17 @@ export const AdminPage: React.FC = () => {
 
             <button
               type="submit"
-              className="w-full py-3 text-xs tracking-[0.16em] uppercase font-semibold text-white bg-[#111111] hover:bg-black transition-colors cursor-pointer"
+              disabled={isLoggingIn}
+              className="w-full py-3 text-xs tracking-[0.16em] uppercase font-semibold text-white bg-[#111111] hover:bg-black transition-colors cursor-pointer flex items-center justify-center gap-2 disabled:opacity-60"
             >
-              Access Atelier Portal
+              {isLoggingIn ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>Authenticating...</span>
+                </>
+              ) : (
+                <span>Access Atelier Portal</span>
+              )}
             </button>
           </form>
 
@@ -258,23 +330,34 @@ export const AdminPage: React.FC = () => {
   const bespokeCount = products.filter((p) => p.collection === 'Bespoke').length;
 
   return (
-    <div className="bg-white min-h-screen pb-24">
+    <div className="bg-white min-h-screen pb-24 font-sans-ui">
       {/* Top Admin Header */}
-      <div className="border-b border-[#E5E5E5] bg-[#FAFAFA] py-8 sm:py-12">
+      <div className="border-b border-[#E5E5E5] bg-[#FAFAFA] py-8 sm:py-10">
         <div className="max-w-7xl mx-auto px-6 sm:px-8 space-y-4">
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
             <div>
               <div className="flex items-center gap-2 text-xs text-[#777777] font-mono">
                 <span>Atelier Manager</span>
                 <span>/</span>
-                <span className="text-[#111111]">Active Catalog</span>
+                <span className="text-[#111111]">Cloudflare D1 & R2 Catalog</span>
               </div>
               <h1 className="font-editorial text-3xl sm:text-4xl text-[#111111] font-medium mt-1">
                 Collection & Product Management
               </h1>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={handleManualRefresh}
+                disabled={isRefreshing}
+                className="px-3 py-2.5 text-xs text-[#555555] bg-white border border-[#CCCCCC] hover:border-black transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                title="Refresh from Cloudflare D1"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
+                <span>Sync</span>
+              </button>
+
               <button
                 type="button"
                 onClick={handleOpenAdd}
@@ -283,18 +366,74 @@ export const AdminPage: React.FC = () => {
                 <Plus className="w-4 h-4" />
                 <span>Add Garment</span>
               </button>
+
               <Link
                 to="/collections"
-                className="px-4 py-2.5 text-xs tracking-wider uppercase font-medium text-[#111111] border border-[#CCCCCC] hover:border-black transition-colors flex items-center gap-1.5"
+                className="px-4 py-2.5 text-xs tracking-wider uppercase font-medium text-[#111111] border border-[#CCCCCC] hover:border-black transition-colors flex items-center gap-1.5 bg-white"
               >
-                <span>View Live Site</span>
+                <span>Live Site</span>
                 <ExternalLink className="w-3.5 h-3.5" />
               </Link>
+
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="px-3 py-2.5 text-xs text-[#777777] hover:text-[#111111] transition-colors cursor-pointer"
+                title="Log out of atelier portal"
+              >
+                Log Out
+              </button>
+            </div>
+          </div>
+
+          {/* Cloudflare Storage & Binding Health Indicator */}
+          <div className="p-3 bg-white border border-[#E5E5E5] flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs">
+            <div className="flex flex-wrap items-center gap-4">
+              <div className="flex items-center gap-1.5">
+                <Database className="w-4 h-4 text-[#C5A880]" />
+                <span className="font-semibold text-[#111111]">Cloudflare D1:</span>
+                {backendHealth?.d1.operational ? (
+                  <span className="inline-flex items-center gap-1 text-[11px] text-emerald-700 bg-emerald-50 px-2 py-0.5 border border-emerald-200">
+                    <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                    <span>Connected & Operational</span>
+                  </span>
+                ) : backendHealth?.d1.configured ? (
+                  <span className="inline-flex items-center gap-1 text-[11px] text-amber-700 bg-amber-50 px-2 py-0.5 border border-amber-200">
+                    <AlertCircle className="w-3 h-3 text-amber-600" />
+                    <span>Binding Configured (Pending Migrations)</span>
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 text-[11px] text-[#777777] bg-neutral-100 px-2 py-0.5 border border-[#CCCCCC]">
+                    <span>Local/Fallback Mode (Awaiting D1 ID in wrangler.toml)</span>
+                  </span>
+                )}
+              </div>
+
+              <span className="hidden sm:inline text-[#CCCCCC]">|</span>
+
+              <div className="flex items-center gap-1.5">
+                <Cloud className="w-4 h-4 text-sky-600" />
+                <span className="font-semibold text-[#111111]">Cloudflare R2:</span>
+                {backendHealth?.r2.configured ? (
+                  <span className="inline-flex items-center gap-1 text-[11px] text-sky-800 bg-sky-50 px-2 py-0.5 border border-sky-200">
+                    <CheckCircle2 className="w-3 h-3 text-sky-600" />
+                    <span>Bucket Bound (kraysdhaka-images)</span>
+                  </span>
+                ) : (
+                  <span className="text-[11px] text-[#777777] bg-neutral-100 px-2 py-0.5 border border-[#CCCCCC]">
+                    <span>Images bound via Worker /api/images route</span>
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="text-[11px] text-[#666666] font-mono">
+              Shared Catalog: {isRemote ? 'Live Cloud D1' : 'Initial Baseline Cache'}
             </div>
           </div>
 
           {/* Catalog KPI Strip */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 pt-4 border-t border-[#EAEAEA] text-xs">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 pt-2 border-t border-[#EAEAEA] text-xs">
             <div className="p-3 bg-white border border-[#E5E5E5]">
               <span className="text-[#777777] block text-[10px] uppercase tracking-wider">Total Garments</span>
               <span className="text-lg font-semibold text-[#111111] tabular-nums">{products.length}</span>
@@ -317,22 +456,6 @@ export const AdminPage: React.FC = () => {
 
       {/* Main Container */}
       <div className="max-w-7xl mx-auto px-6 sm:px-8 py-8 space-y-6">
-        {/* Global Storage Error Notification if present */}
-        {storageError && (
-          <div className="p-4 bg-amber-50 border border-amber-300 text-amber-900 text-xs flex items-center justify-between">
-            <div className="flex items-center gap-2.5">
-              <AlertCircle className="w-4 h-4 text-amber-700 shrink-0" />
-              <span>{storageError}</span>
-            </div>
-            <button
-              onClick={clearStorageError}
-              className="text-amber-700 hover:text-amber-900 font-medium ml-4 cursor-pointer"
-            >
-              Dismiss
-            </button>
-          </div>
-        )}
-
         {/* Action success notification with link to newly created garment */}
         {actionSuccess && (
           <div className="p-3.5 bg-neutral-900 text-white text-xs flex items-center justify-between">
@@ -355,15 +478,11 @@ export const AdminPage: React.FC = () => {
           </div>
         )}
 
-        {/* Toolbar: Storage & Export & Reset */}
+        {/* Toolbar: Export & Reset */}
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-4 p-4 bg-neutral-50 border border-[#E5E5E5] text-xs text-[#555555]">
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-1.5 text-[11px] text-[#444444] font-mono">
-              <Database className="w-3.5 h-3.5 text-[#777777]" />
-              <span>Storage: {storageUsage.formattedUsed} ({storageUsage.percentageUsed}% of limit)</span>
-            </div>
-            <span className="text-[#CCCCCC]">|</span>
-            <span className="text-[#666666]">Images automatically optimized for instant browsing</span>
+          <div className="flex items-center gap-2">
+            <Database className="w-3.5 h-3.5 text-[#777777]" />
+            <span>Garment changes automatically persist to Cloudflare D1 and publish immediately to all visitors.</span>
           </div>
 
           <div className="flex items-center gap-3">
@@ -380,7 +499,7 @@ export const AdminPage: React.FC = () => {
               ) : (
                 <>
                   <Copy className="w-3.5 h-3.5" />
-                  <span>Export JSON for Codebase</span>
+                  <span>Export JSON</span>
                 </>
               )}
             </button>
@@ -391,7 +510,7 @@ export const AdminPage: React.FC = () => {
               className="px-3 py-1.5 bg-white border border-[#CCCCCC] hover:border-red-600 text-[#666666] hover:text-red-600 flex items-center gap-1.5 cursor-pointer"
             >
               <RotateCcw className="w-3.5 h-3.5" />
-              <span>Reset to Factory Catalog</span>
+              <span>Reset Catalog</span>
             </button>
           </div>
         </div>
@@ -405,83 +524,100 @@ export const AdminPage: React.FC = () => {
                 <th className="p-3.5 font-semibold">Collection</th>
                 <th className="p-3.5 font-semibold">Category</th>
                 <th className="p-3.5 font-semibold">Starting Price</th>
+                <th className="p-3.5 font-semibold">Status</th>
                 <th className="p-3.5 font-semibold">Silhouette & Fabric</th>
                 <th className="p-3.5 font-semibold text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[#EAEAEA]">
-              {products.map((item) => (
-                <tr key={item.id} className="hover:bg-neutral-50/60 transition-colors">
-                  <td className="p-3.5">
-                    <div className="flex items-center gap-3">
-                      <img
-                        src={item.image}
-                        alt={item.name}
-                        referrerPolicy="no-referrer"
-                        className="w-12 h-14 object-cover border border-[#E5E5E5] shrink-0 bg-neutral-100"
-                        onError={(e) => {
-                          // Fallback to essential suit image if broken
-                          (e.target as HTMLImageElement).src = IMAGES.essential;
-                        }}
-                      />
-                      <div>
+              {products.map((item: any) => {
+                const isPublished = item.status !== 'draft';
+                return (
+                  <tr key={item.id} className="hover:bg-neutral-50/60 transition-colors">
+                    <td className="p-3.5">
+                      <div className="flex items-center gap-3">
+                        <img
+                          src={item.image}
+                          alt={item.name}
+                          referrerPolicy="no-referrer"
+                          className="w-12 h-14 object-cover border border-[#E5E5E5] shrink-0 bg-neutral-100"
+                          onError={(e) => {
+                            (e.target as HTMLImageElement).src = IMAGES.essential;
+                          }}
+                        />
+                        <div>
+                          <Link
+                            to={`/product/${item.id}`}
+                            className="text-sm text-[#111111] font-editorial font-medium hover:underline block"
+                          >
+                            {item.name}
+                          </Link>
+                          <span className="text-[10px] text-[#777777] font-mono">{item.id}</span>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="p-3.5">
+                      <span className="text-xs font-medium text-[#222222]">
+                        {item.collection}
+                      </span>
+                    </td>
+                    <td className="p-3.5 text-[#555555]">
+                      {item.category}
+                    </td>
+                    <td className="p-3.5 font-semibold text-[#111111] tabular-nums">
+                      {formatBDT(item.startingPrice)}
+                    </td>
+                    <td className="p-3.5">
+                      <button
+                        type="button"
+                        onClick={() => handleTogglePublication(item)}
+                        className={`px-2 py-0.5 text-[10px] uppercase font-mono tracking-wider cursor-pointer border transition-colors ${
+                          isPublished
+                            ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
+                            : 'bg-amber-50 text-amber-800 border-amber-200 hover:bg-amber-100'
+                        }`}
+                        title="Click to toggle status"
+                      >
+                        {isPublished ? 'Published' : 'Draft'}
+                      </button>
+                    </td>
+                    <td className="p-3.5 max-w-xs text-[#666666]">
+                      <p className="line-clamp-1">{item.silhouette}</p>
+                      <p className="text-[10px] text-[#888888] line-clamp-1">{item.fabricDetails}</p>
+                    </td>
+                    <td className="p-3.5 text-right whitespace-nowrap">
+                      <div className="inline-flex items-center gap-2">
                         <Link
                           to={`/product/${item.id}`}
-                          className="text-sm text-[#111111] font-editorial font-medium hover:underline block"
+                          className="p-1.5 text-[#666666] hover:text-[#111111] hover:bg-neutral-100 transition-colors cursor-pointer"
+                          title="View garment page"
+                          aria-label={`View ${item.name} page`}
                         >
-                          {item.name}
+                          <Eye className="w-4 h-4" />
                         </Link>
-                        <span className="text-[10px] text-[#777777] font-mono">{item.id}</span>
+                        <button
+                          type="button"
+                          onClick={() => handleOpenEdit(item)}
+                          className="p-1.5 text-[#444444] hover:text-[#111111] hover:bg-neutral-100 transition-colors cursor-pointer"
+                          title="Edit garment"
+                          aria-label={`Edit ${item.name}`}
+                        >
+                          <Edit2 className="w-4 h-4" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setItemToDelete({ id: item.id, name: item.name })}
+                          className="p-1.5 text-neutral-500 hover:text-red-700 hover:bg-red-50 border border-transparent hover:border-red-200 transition-colors cursor-pointer focus-visible:outline-red-600"
+                          title="Remove garment"
+                          aria-label={`Delete ${item.name}`}
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
                       </div>
-                    </div>
-                  </td>
-                  <td className="p-3.5">
-                    <span className="text-xs font-medium text-[#222222]">
-                      {item.collection}
-                    </span>
-                  </td>
-                  <td className="p-3.5 text-[#555555]">
-                    {item.category}
-                  </td>
-                  <td className="p-3.5 font-semibold text-[#111111] tabular-nums">
-                    {formatBDT(item.startingPrice)}
-                  </td>
-                  <td className="p-3.5 max-w-xs text-[#666666]">
-                    <p className="line-clamp-1">{item.silhouette}</p>
-                    <p className="text-[10px] text-[#888888] line-clamp-1">{item.fabricDetails}</p>
-                  </td>
-                  <td className="p-3.5 text-right whitespace-nowrap">
-                    <div className="inline-flex items-center gap-2">
-                      <Link
-                        to={`/product/${item.id}`}
-                        className="p-1.5 text-[#666666] hover:text-[#111111] hover:bg-neutral-100 transition-colors cursor-pointer"
-                        title="View garment page"
-                        aria-label={`View ${item.name} page`}
-                      >
-                        <Eye className="w-4 h-4" />
-                      </Link>
-                      <button
-                        type="button"
-                        onClick={() => handleOpenEdit(item)}
-                        className="p-1.5 text-[#444444] hover:text-[#111111] hover:bg-neutral-100 transition-colors cursor-pointer"
-                        title="Edit garment"
-                        aria-label={`Edit ${item.name}`}
-                      >
-                        <Edit2 className="w-4 h-4" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setItemToDelete({ id: item.id, name: item.name })}
-                        className="p-1.5 text-neutral-500 hover:text-red-700 hover:bg-red-50 border border-transparent hover:border-red-200 transition-colors cursor-pointer focus-visible:outline-red-600"
-                        title="Remove garment"
-                        aria-label={`Delete ${item.name}`}
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -508,7 +644,7 @@ export const AdminPage: React.FC = () => {
               </button>
             </div>
             <p className="text-xs text-[#555555] font-sans-ui leading-relaxed">
-              Are you sure you want to remove <strong className="text-[#111111]">"{itemToDelete.name}"</strong> from the active collection? This will immediately remove it from all storefront views.
+              Are you sure you want to remove <strong className="text-[#111111]">"{itemToDelete.name}"</strong>? This will permanently delete its record from Cloudflare D1 and clean up its associated photography in Cloudflare R2.
             </p>
             <div className="pt-2 flex items-center justify-end gap-3">
               <button
@@ -540,7 +676,7 @@ export const AdminPage: React.FC = () => {
           <div className="bg-white border border-[#E5E5E5] w-full max-w-md p-6 shadow-2xl space-y-4">
             <div className="flex items-center justify-between border-b border-[#E5E5E5] pb-3">
               <h3 className="font-editorial text-xl text-[#111111] font-medium">
-                Reset to Factory Catalog
+                Reset Catalog Cache
               </h3>
               <button
                 type="button"
@@ -551,7 +687,7 @@ export const AdminPage: React.FC = () => {
               </button>
             </div>
             <p className="text-xs text-[#555555] font-sans-ui leading-relaxed">
-              This will restore all default 9 KRAYS DHAKA products and discard any custom products added in this browser.
+              This will restore the 9 baseline house garments in your local session. To reset the production Cloudflare D1 database, re-run migration 0002_seed_products.sql via Wrangler CLI.
             </p>
             <div className="pt-2 flex items-center justify-end gap-3">
               <button
@@ -566,12 +702,12 @@ export const AdminPage: React.FC = () => {
                 onClick={() => {
                   resetToDefault();
                   setIsResetConfirmOpen(false);
-                  setActionSuccess('Catalog restored to original defaults.');
+                  setActionSuccess('Catalog cache restored to default house suits.');
                   setTimeout(() => setActionSuccess(null), 3000);
                 }}
                 className="px-4 py-2 bg-[#111111] hover:bg-black text-white text-xs font-semibold cursor-pointer"
               >
-                Reset Catalog
+                Reset Local Cache
               </button>
             </div>
           </div>
@@ -596,7 +732,7 @@ export const AdminPage: React.FC = () => {
 
             <div className="pb-3 border-b border-[#E5E5E5] mb-5">
               <span className="text-[10px] tracking-[0.2em] uppercase text-[#777777] font-mono block">
-                Atelier Collection Editor
+                Atelier Cloudflare D1 & R2 Editor
               </span>
               <h2 className="font-editorial text-2xl text-[#111111] font-medium mt-0.5">
                 {editingId ? 'Edit Garment Details' : 'Add New Garment to Collection'}
@@ -616,7 +752,7 @@ export const AdminPage: React.FC = () => {
                 </div>
               )}
 
-              {/* Direct Image Upload Field (Top priority for user) */}
+              {/* Direct R2 Image Upload Field */}
               <div className="p-4 bg-neutral-50/60 border border-[#E5E5E5]">
                 <ImageUploadField
                   currentImage={formData.image || ''}
@@ -655,7 +791,7 @@ export const AdminPage: React.FC = () => {
                         startingPrice: e.target.value === '' ? null : Number(e.target.value)
                       })
                     }
-                    placeholder="e.g. 8500 (leave blank for quotation)"
+                    placeholder="e.g. 8500 (leave blank for consultation)"
                     className="w-full px-3 py-2 border border-[#CCCCCC] focus:border-black outline-none"
                   />
                   <span className="text-[10px] text-[#777777] mt-0.5 block">
@@ -664,8 +800,8 @@ export const AdminPage: React.FC = () => {
                 </div>
               </div>
 
-              {/* Collection & Category */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {/* Collection, Category & Publication Status */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
                   <label className="block uppercase tracking-wider font-semibold text-[#222222] mb-1">
                     Collection Tier
@@ -694,6 +830,20 @@ export const AdminPage: React.FC = () => {
                     <option value="Double-Breasted">Double-Breasted Suit</option>
                     <option value="Formalwear">Formalwear & Tuxedos</option>
                     <option value="Separates">Shirts, Trousers & Waistcoats</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block uppercase tracking-wider font-semibold text-[#222222] mb-1">
+                    Publication Status
+                  </label>
+                  <select
+                    value={formData.status || 'published'}
+                    onChange={(e) => setFormData({ ...formData, status: e.target.value as any })}
+                    className="w-full px-2.5 py-2 border border-[#CCCCCC] focus:border-black outline-none cursor-pointer bg-white font-mono"
+                  >
+                    <option value="published">Published (Live to Visitors)</option>
+                    <option value="draft">Draft (Atelier Only)</option>
                   </select>
                 </div>
               </div>
@@ -794,9 +944,17 @@ export const AdminPage: React.FC = () => {
                 </button>
                 <button
                   type="submit"
-                  className="px-6 py-2.5 bg-[#111111] text-white hover:bg-black font-semibold cursor-pointer shadow-xs tracking-wider uppercase text-xs"
+                  disabled={isSubmitting}
+                  className="px-6 py-2.5 bg-[#111111] text-white hover:bg-black font-semibold cursor-pointer shadow-xs tracking-wider uppercase text-xs flex items-center gap-2 disabled:opacity-60"
                 >
-                  {editingId ? 'Save Changes' : 'Post & Publish Garment'}
+                  {isSubmitting ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Saving to Cloudflare D1...</span>
+                    </>
+                  ) : (
+                    <span>{editingId ? 'Save Changes' : 'Post & Publish Garment'}</span>
+                  )}
                 </button>
               </div>
             </form>

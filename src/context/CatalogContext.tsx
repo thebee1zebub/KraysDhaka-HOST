@@ -1,26 +1,41 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
 import { Product, PRODUCTS as DEFAULT_PRODUCTS, IMAGES } from '../data/tailoringData';
 import { generateUniqueProductId } from '../utils/catalogSlug';
+import {
+  fetchPublishedProducts,
+  createProductInD1,
+  updateProductInD1,
+  deleteProductFromD1,
+  toggleProductStatusInD1,
+  checkBackendHealth,
+  BackendHealthResponse,
+  getStoredToken,
+} from '../services/api';
 
-const STORAGE_KEY = 'krays_dhaka_catalog_v1';
+const FALLBACK_STORAGE_KEY = 'krays_dhaka_catalog_cache_v2';
 
 interface CatalogContextType {
   products: Product[];
-  addProduct: (product: Omit<Product, 'id'> & { id?: string }) => Product;
-  updateProduct: (id: string, updates: Partial<Product>) => void;
-  removeProduct: (id: string) => void;
+  isLoading: boolean;
+  isRemote: boolean;
+  backendHealth: BackendHealthResponse | null;
+  storageError: string | null;
+  clearStorageError: () => void;
+  refreshProducts: () => Promise<void>;
+  addProduct: (product: Omit<Product, 'id'> & { id?: string; status?: 'published' | 'draft' }) => Promise<Product>;
+  updateProduct: (id: string, updates: Partial<Product>) => Promise<void>;
+  removeProduct: (id: string) => Promise<void>;
+  toggleProductStatus: (id: string, status: 'published' | 'draft') => Promise<void>;
   resetToDefault: () => void;
   exportCatalogJson: () => string;
   importCatalogJson: (jsonStr: string) => boolean;
-  storageError: string | null;
-  clearStorageError: () => void;
 }
 
 const CatalogContext = createContext<CatalogContextType | null>(null);
 
-function loadSavedProducts(): Product[] {
+function loadCachedProducts(): Product[] {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = localStorage.getItem(FALLBACK_STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed) && parsed.length > 0) {
@@ -28,32 +43,67 @@ function loadSavedProducts(): Product[] {
       }
     }
   } catch (e) {
-    console.error('Failed to parse catalog from localStorage', e);
+    console.warn('Failed to parse cached products from localStorage', e);
   }
   return DEFAULT_PRODUCTS;
 }
 
 export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const [products, setProducts] = useState<Product[]>(loadSavedProducts);
+  const [products, setProducts] = useState<Product[]>(loadCachedProducts);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isRemote, setIsRemote] = useState<boolean>(false);
+  const [backendHealth, setBackendHealth] = useState<BackendHealthResponse | null>(null);
   const [storageError, setStorageError] = useState<string | null>(null);
 
-  useEffect(() => {
+  // Fetch live products from Cloudflare D1
+  const refreshProducts = useCallback(async () => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(products));
-      setStorageError(null);
-    } catch (e: any) {
-      console.error('Failed to save catalog to localStorage', e);
-      const isQuota = e?.name === 'QuotaExceededError' || e?.code === 22 || e?.number === -2147024882;
-      setStorageError(
-        isQuota
-          ? 'Browser storage quota exceeded. Consider optimizing uploaded photos or removing older products.'
-          : 'Failed to persist changes to local storage.'
-      );
-    }
-  }, [products]);
+      setIsLoading(true);
 
-  const addProduct = (newProduct: Omit<Product, 'id'> & { id?: string }): Product => {
-    // Generate safe unique ID even with collisions or special characters
+      // Check Cloudflare Worker bindings health
+      const health = await checkBackendHealth();
+      setBackendHealth(health);
+
+      const { products: remoteProducts, error } = await fetchPublishedProducts();
+
+      if (!error && Array.isArray(remoteProducts) && remoteProducts.length > 0) {
+        setProducts(remoteProducts);
+        setIsRemote(true);
+        setStorageError(null);
+        try {
+          localStorage.setItem(FALLBACK_STORAGE_KEY, JSON.stringify(remoteProducts));
+        } catch {
+          // Ignore cache quota errors
+        }
+      } else {
+        // If D1 is empty or not yet provisioned, use default/cached products
+        if (remoteProducts && remoteProducts.length === 0 && health?.d1.operational) {
+          // D1 is running but empty
+          setProducts([]);
+          setIsRemote(true);
+        } else {
+          // Network or binding unconfigured fallback
+          setIsRemote(false);
+          if (error && !health?.d1.configured) {
+            // Not a fatal user error - initial state before D1 setup
+          }
+        }
+      }
+    } catch (err: any) {
+      console.warn('Could not connect to shared D1 catalog, using local fallback:', err);
+      setIsRemote(false);
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshProducts();
+  }, [refreshProducts]);
+
+  const addProduct = async (
+    newProduct: Omit<Product, 'id'> & { id?: string; status?: 'published' | 'draft' }
+  ): Promise<Product> => {
     const existingIds = products.map((p) => p.id);
     const generatedId = newProduct.id && !existingIds.includes(newProduct.id)
       ? newProduct.id
@@ -68,63 +118,99 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
       ...newProduct,
       id: generatedId,
       image: safeImage,
-      galleryImages: safeGallery.length > 0 ? safeGallery : [safeImage]
+      galleryImages: safeGallery.length > 0 ? safeGallery : [safeImage],
     };
 
-    const nextProducts = [productToAdd, ...products];
+    const token = getStoredToken();
 
-    // Pre-flight test to catch quota issues immediately before setting state
-    try {
-      const testJson = JSON.stringify(nextProducts);
-      localStorage.setItem(STORAGE_KEY, testJson);
-      setStorageError(null);
-    } catch (err: any) {
-      const isQuota = err?.name === 'QuotaExceededError' || err?.code === 22;
-      const msg = isQuota
-        ? 'Image file is too large for browser storage. Please upload an optimized image.'
-        : 'Failed to save product to storage.';
-      setStorageError(msg);
-      throw new Error(msg);
+    // 1. Attempt D1 remote persistence
+    if (backendHealth?.d1.configured && token) {
+      const result = await createProductInD1(
+        {
+          ...productToAdd,
+          status: newProduct.status || 'published',
+        },
+        token
+      );
+
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to save product to Cloudflare D1 database.');
+      }
+
+      await refreshProducts();
+      return productToAdd;
     }
 
+    // 2. Fallback local persistence (if D1 not yet configured)
+    const nextProducts = [productToAdd, ...products];
     setProducts(nextProducts);
+    try {
+      localStorage.setItem(FALLBACK_STORAGE_KEY, JSON.stringify(nextProducts));
+    } catch (e) {
+      console.warn('Failed to update local cache', e);
+    }
+
     return productToAdd;
   };
 
-  const updateProduct = (id: string, updates: Partial<Product>) => {
+  const updateProduct = async (id: string, updates: Partial<Product>): Promise<void> => {
+    const token = getStoredToken();
+
+    if (backendHealth?.d1.configured && token) {
+      const result = await updateProductInD1(id, updates, token);
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to update garment in Cloudflare D1.');
+      }
+      await refreshProducts();
+      return;
+    }
+
     const nextProducts = products.map((item) =>
       item.id === id ? { ...item, ...updates } : item
     );
-
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(nextProducts));
-      setStorageError(null);
-    } catch (err: any) {
-      const isQuota = err?.name === 'QuotaExceededError' || err?.code === 22;
-      const msg = isQuota
-        ? 'Changes exceed browser storage quota. Please use compressed images.'
-        : 'Failed to save update to storage.';
-      setStorageError(msg);
-      throw new Error(msg);
-    }
-
     setProducts(nextProducts);
+    try {
+      localStorage.setItem(FALLBACK_STORAGE_KEY, JSON.stringify(nextProducts));
+    } catch (e) {
+      console.warn('Failed to update local cache', e);
+    }
   };
 
-  const removeProduct = (id: string) => {
-    const nextProducts = products.filter((item) => item.id !== id);
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(nextProducts));
-      setStorageError(null);
-    } catch (e) {
-      console.error('Failed to update storage on remove', e);
+  const toggleProductStatus = async (id: string, status: 'published' | 'draft'): Promise<void> => {
+    const token = getStoredToken();
+    if (backendHealth?.d1.configured && token) {
+      const result = await toggleProductStatusInD1(id, status, token);
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to toggle status.');
+      }
+      await refreshProducts();
     }
+  };
+
+  const removeProduct = async (id: string): Promise<void> => {
+    const token = getStoredToken();
+
+    if (backendHealth?.d1.configured && token) {
+      const result = await deleteProductFromD1(id, token);
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to remove garment from Cloudflare D1.');
+      }
+      await refreshProducts();
+      return;
+    }
+
+    const nextProducts = products.filter((item) => item.id !== id);
     setProducts(nextProducts);
+    try {
+      localStorage.setItem(FALLBACK_STORAGE_KEY, JSON.stringify(nextProducts));
+    } catch (e) {
+      console.warn('Failed to update local cache on remove', e);
+    }
   };
 
   const resetToDefault = () => {
     setProducts(DEFAULT_PRODUCTS);
-    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(FALLBACK_STORAGE_KEY);
     setStorageError(null);
   };
 
@@ -137,7 +223,7 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
       const parsed = JSON.parse(jsonStr);
       if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].name) {
         setProducts(parsed);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
+        localStorage.setItem(FALLBACK_STORAGE_KEY, JSON.stringify(parsed));
         setStorageError(null);
         return true;
       }
@@ -153,14 +239,19 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
     <CatalogContext.Provider
       value={{
         products,
+        isLoading,
+        isRemote,
+        backendHealth,
+        storageError,
+        clearStorageError,
+        refreshProducts,
         addProduct,
         updateProduct,
         removeProduct,
+        toggleProductStatus,
         resetToDefault,
         exportCatalogJson,
         importCatalogJson,
-        storageError,
-        clearStorageError
       }}
     >
       {children}

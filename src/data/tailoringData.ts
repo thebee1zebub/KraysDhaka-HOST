@@ -16,6 +16,9 @@ export interface Product {
   image: string;
   galleryImages: string[];
   features: string[];
+  status?: 'published' | 'draft';
+  createdAt?: number;
+  updatedAt?: number;
 }
 
 export interface BrandConfig {

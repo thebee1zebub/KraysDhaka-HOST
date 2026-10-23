@@ -137,26 +137,29 @@ To update starting prices across the brand, simply update the `startingPrice` nu
 
 ---
 
-## Cloudflare Pages & Hosting Guide (Recommended)
+## Cloudflare Workers & Hosting Guide (Recommended)
 
-Cloudflare Pages provides the fastest worldwide CDN edge hosting, free SSL, DDoS protection, and continuous automatic deployment with zero configuration.
+This project is configured to deploy as a **Cloudflare Worker with Static Assets** (`kraysdhaka-host`), delivering global edge speed, automatic SSL, and SPA sub-route support.
 
 For the full detailed walkthrough, see **[CLOUDFLARE_DEPLOYMENT.md](./CLOUDFLARE_DEPLOYMENT.md)**.
 
-### Quick Cloudflare Setup via Git:
-1. Push your repository to GitHub.
-2. In the [Cloudflare Dashboard](https://dash.cloudflare.com/), go to **Workers & Pages** → **Create application** → **Pages** → **Connect to Git**.
-3. Select `krays-dhaka`.
-4. Configure Build Settings:
-   - **Framework preset**: `Vite` (or None)
-   - **Build command**: `npm run build`
-   - **Build output directory**: `dist`
-5. Click **Save and Deploy**. Your site will be live at `https://krays-dhaka.pages.dev` in ~45 seconds!
+### Build & Deploy Configuration:
+- **Worker Name**: `kraysdhaka-host`
+- **Build command**: `bun run build` (or `npm run build`)
+- **Deploy command**: `npx wrangler deploy`
+- **Assets Directory**: `./dist` (defined in `wrangler.toml`)
+- **Compatibility Date**: `2026-10-23`
 
-### Quick Cloudflare Setup via Direct Upload (Drag-and-Drop):
-1. Run `npm run build` locally.
-2. Go to **Workers & Pages** → **Create application** → **Pages** → **Upload assets**.
-3. Drag and drop the generated `dist` folder directly onto Cloudflare. Click **Deploy site**!
+### Deploying via CLI:
+```bash
+# Using Bun:
+bun run build
+npx wrangler deploy
+
+# Or using npm:
+npm run build
+npm run deploy
+```
 
 ---
 
@@ -286,8 +289,9 @@ npm run lint
 # Build for production (outputs to dist/)
 npm run build
 
-# Deploy directly to Cloudflare Pages (requires Cloudflare login)
-npm run deploy:cf
+# Deploy to Cloudflare Workers (requires Cloudflare login)
+npx wrangler deploy
+# or: npm run deploy
 ```
 
 ---

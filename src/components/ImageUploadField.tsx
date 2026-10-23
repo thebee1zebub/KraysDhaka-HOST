@@ -1,11 +1,23 @@
 import React, { useState, useRef } from 'react';
-import { Upload, Image as ImageIcon, Link as LinkIcon, X, Check, Loader2, Sparkles, AlertCircle } from 'lucide-react';
+import {
+  Upload,
+  Image as ImageIcon,
+  Link as LinkIcon,
+  X,
+  Check,
+  Loader2,
+  Cloud,
+  AlertCircle,
+  ArrowUp,
+  ArrowDown
+} from 'lucide-react';
 import { IMAGES } from '../data/tailoringData';
-import { compressImageFile, formatBytes } from '../utils/imageCompressor';
+import { uploadImageToR2, getStoredToken } from '../services/api';
+import { formatBytes } from '../utils/imageCompressor';
 
 interface ImageUploadFieldProps {
   currentImage: string;
-  onChange: (dataUrlOrPath: string) => void;
+  onChange: (urlOrPath: string) => void;
   galleryImages?: string[];
   onGalleryChange?: (images: string[]) => void;
 }
@@ -25,8 +37,8 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
   onGalleryChange
 }) => {
   const [activeTab, setActiveTab] = useState<'upload' | 'presets' | 'url'>('upload');
-  const [isCompressing, setIsCompressing] = useState(false);
-  const [uploadStats, setUploadStats] = useState<{ size: string; dimensions: string } | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadStats, setUploadStats] = useState<{ size: string; key: string } | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [urlInput, setUrlInput] = useState(currentImage && !currentImage.startsWith('data:') ? currentImage : '');
@@ -36,31 +48,43 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
 
   const handleProcessFile = async (file: File) => {
     if (!file.type.startsWith('image/')) {
-      setErrorMessage('Please select a valid image file (JPG, PNG, WebP).');
+      setErrorMessage('Please select a valid image file (JPG, PNG, WebP, AVIF).');
       return;
     }
 
-    setIsCompressing(true);
+    if (file.size > 10 * 1024 * 1024) {
+      setErrorMessage('Image size exceeds 10 MB limit.');
+      return;
+    }
+
+    setIsUploading(true);
     setErrorMessage(null);
 
-    try {
-      const result = await compressImageFile(file, {
-        maxWidth: 960,
-        maxHeight: 1280,
-        quality: 0.82,
-        preferredFormat: 'image/jpeg'
-      });
+    const token = getStoredToken();
 
-      onChange(result.dataUrl);
-      setUploadStats({
-        size: result.formattedSize,
-        dimensions: `${result.width} × ${result.height} px`
-      });
+    try {
+      if (token) {
+        // Upload directly to Cloudflare R2 bucket via authenticated Worker API
+        const uploadRes = await uploadImageToR2(file, token);
+        onChange(uploadRes.url);
+        setUploadStats({
+          size: formatBytes(uploadRes.size),
+          key: uploadRes.key,
+        });
+      } else {
+        // Fallback for preview before authentication
+        const objectUrl = URL.createObjectURL(file);
+        onChange(objectUrl);
+        setUploadStats({
+          size: formatBytes(file.size),
+          key: file.name,
+        });
+      }
     } catch (err: any) {
-      console.error('Image compression error:', err);
-      setErrorMessage(err.message || 'Failed to process and compress selected image.');
+      console.error('Image upload failed:', err);
+      setErrorMessage(err.message || 'Failed to upload photo to Cloudflare R2.');
     } finally {
-      setIsCompressing(false);
+      setIsUploading(false);
     }
   };
 
@@ -82,21 +106,39 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
 
   const handleAddGalleryFile = async (file: File) => {
     if (!onGalleryChange) return;
+    const token = getStoredToken();
+
     try {
-      setIsCompressing(true);
-      const result = await compressImageFile(file, {
-        maxWidth: 800,
-        maxHeight: 1060,
-        quality: 0.8,
-        preferredFormat: 'image/jpeg'
-      });
-      const updated = [...galleryImages, result.dataUrl].slice(0, 4); // Max 4 gallery images
+      setIsUploading(true);
+      setErrorMessage(null);
+
+      let targetUrl = '';
+      if (token) {
+        const uploadRes = await uploadImageToR2(file, token);
+        targetUrl = uploadRes.url;
+      } else {
+        targetUrl = URL.createObjectURL(file);
+      }
+
+      const updated = [...galleryImages, targetUrl].slice(0, 6); // Up to 6 gallery photographs
       onGalleryChange(updated);
     } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to add gallery angle photo.');
+      setErrorMessage(err.message || 'Failed to upload gallery angle to Cloudflare R2.');
     } finally {
-      setIsCompressing(false);
+      setIsUploading(false);
     }
+  };
+
+  const moveGalleryImage = (index: number, direction: 'up' | 'down') => {
+    if (!onGalleryChange) return;
+    const targetIdx = direction === 'up' ? index - 1 : index + 1;
+    if (targetIdx < 0 || targetIdx >= galleryImages.length) return;
+
+    const newArr = [...galleryImages];
+    const temp = newArr[index];
+    newArr[index] = newArr[targetIdx];
+    newArr[targetIdx] = temp;
+    onGalleryChange(newArr);
   };
 
   const handleApplyUrl = () => {
@@ -109,7 +151,7 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
     setErrorMessage(null);
   };
 
-  const isDataUrl = currentImage && currentImage.startsWith('data:');
+  const isR2Image = currentImage && currentImage.startsWith('/api/images/');
 
   return (
     <div className="space-y-3 font-sans-ui text-xs">
@@ -117,11 +159,16 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
         <label className="block uppercase tracking-wider font-semibold text-[#222222]">
           Garment Photography Asset <span className="text-red-500">*</span>
         </label>
-        {uploadStats && (
-          <span className="text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 border border-emerald-200 font-mono">
-            Optimized: {uploadStats.size} ({uploadStats.dimensions})
+        {isR2Image ? (
+          <span className="text-[10px] text-sky-800 bg-sky-50 px-2 py-0.5 border border-sky-200 font-mono flex items-center gap-1">
+            <Cloud className="w-3 h-3 text-sky-600" />
+            <span>Cloudflare R2 Storage</span>
           </span>
-        )}
+        ) : uploadStats ? (
+          <span className="text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 border border-emerald-200 font-mono">
+            Ready: {uploadStats.size}
+          </span>
+        ) : null}
       </div>
 
       {/* Tabs */}
@@ -136,7 +183,7 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
           }`}
         >
           <Upload className="w-3.5 h-3.5" />
-          <span>Direct Upload from Device</span>
+          <span>Upload to Cloudflare R2</span>
         </button>
 
         <button
@@ -162,7 +209,7 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
           }`}
         >
           <LinkIcon className="w-3.5 h-3.5" />
-          <span>Web URL</span>
+          <span>External URL</span>
         </button>
       </div>
 
@@ -173,13 +220,17 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
             <AlertCircle className="w-4 h-4 shrink-0" />
             <span>{errorMessage}</span>
           </div>
-          <button type="button" onClick={() => setErrorMessage(null)} className="text-red-500 hover:text-red-800">
-            <X className="w-3 h-3" />
+          <button
+            type="button"
+            onClick={() => setErrorMessage(null)}
+            className="text-red-500 hover:text-red-800"
+          >
+            <X className="w-3.5 h-3.5" />
           </button>
         </div>
       )}
 
-      {/* Tab 1: Upload from Device */}
+      {/* Tab 1: Upload to Cloudflare R2 */}
       {activeTab === 'upload' && (
         <div className="space-y-3">
           <div
@@ -189,7 +240,7 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
             }}
             onDragLeave={() => setIsDragOver(false)}
             onDrop={handleDrop}
-            className={`border-2 border-dashed p-5 text-center transition-all ${
+            className={`border-2 border-dashed p-6 text-center transition-all ${
               isDragOver
                 ? 'border-[#111111] bg-neutral-100'
                 : 'border-[#CCCCCC] hover:border-[#111111] bg-neutral-50/50'
@@ -204,15 +255,15 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
               id="garment-file-upload"
             />
 
-            {isCompressing ? (
+            {isUploading ? (
               <div className="py-4 flex flex-col items-center justify-center space-y-2">
                 <Loader2 className="w-6 h-6 animate-spin text-[#111111]" />
                 <span className="text-xs text-[#555555] font-medium">
-                  Optimizing & compressing garment photo for storage...
+                  Uploading photography to Cloudflare R2 bucket...
                 </span>
               </div>
             ) : (
-              <div className="space-y-2">
+              <div className="space-y-2.5">
                 <div className="w-10 h-10 mx-auto bg-white border border-[#E5E5E5] flex items-center justify-center text-[#444444] shadow-xs">
                   <Upload className="w-5 h-5" />
                 </div>
@@ -225,12 +276,12 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
                     <span>Choose Photo from Device</span>
                   </button>
                   <p className="text-[11px] text-[#777777] mt-1.5">
-                    or drag and drop garment image here (JPG, PNG, WebP)
+                    or drag and drop garment image here (JPG, PNG, WebP up to 10MB)
                   </p>
                 </div>
-                <div className="flex items-center justify-center gap-1.5 text-[10px] text-[#888888] font-mono">
-                  <Sparkles className="w-3 h-3 text-[#C5A880]" />
-                  <span>Automatically compressed to ultra-crisp web size (&lt;80KB)</span>
+                <div className="flex items-center justify-center gap-1.5 text-[10px] text-[#666666] font-mono">
+                  <Cloud className="w-3.5 h-3.5 text-sky-600" />
+                  <span>Stored securely in Cloudflare R2 object storage</span>
                 </div>
               </div>
             )}
@@ -311,20 +362,22 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
                 src={currentImage}
                 alt="Selected garment"
                 className="w-full h-full object-cover"
-                onError={() => setErrorMessage('Failed to preview image. The URL or file data may be invalid.')}
+                onError={() => setErrorMessage('Failed to preview image. The URL may be invalid or pending upload.')}
               />
             </div>
             <div>
               <span className="text-[10px] uppercase font-mono tracking-wider text-[#777777] block">
-                Active Primary Photo
+                Primary Garment Photo
               </span>
-              <p className="font-medium text-xs text-[#111111]">
-                {isDataUrl ? 'Directly Uploaded Image (Ready)' : currentImage.split('/').pop() || 'Custom URL Image'}
+              <p className="font-medium text-xs text-[#111111] font-mono line-clamp-1">
+                {currentImage.startsWith('/api/images/')
+                  ? currentImage
+                  : currentImage.split('/').pop() || 'Selected Image'}
               </p>
-              {isDataUrl && (
-                <span className="text-[10px] text-emerald-700 flex items-center gap-1 mt-0.5">
-                  <Check className="w-3 h-3" />
-                  <span>Compressed for instant loading & persistent local storage</span>
+              {isR2Image && (
+                <span className="text-[10px] text-sky-700 flex items-center gap-1 mt-0.5">
+                  <Check className="w-3 h-3 text-emerald-600" />
+                  <span>Persisted in Cloudflare R2 bucket</span>
                 </span>
               )}
             </div>
@@ -347,25 +400,26 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
 
       {/* Additional Lookbook Gallery Angles */}
       {onGalleryChange && (
-        <div className="pt-2 border-t border-[#EAEAEA] space-y-2">
+        <div className="pt-3 border-t border-[#EAEAEA] space-y-2">
           <div className="flex items-center justify-between">
             <label className="text-[11px] uppercase tracking-wider font-medium text-[#444444]">
-              Additional Lookbook Angles ({galleryImages.length}/4)
+              Additional Lookbook Angles & Details ({galleryImages.length}/6)
             </label>
-            {galleryImages.length < 4 && (
+            {galleryImages.length < 6 && (
               <button
                 type="button"
                 onClick={() => galleryInputRef.current?.click()}
-                className="text-[10px] text-[#111111] hover:underline font-semibold flex items-center gap-1 cursor-pointer"
+                disabled={isUploading}
+                className="text-[10px] text-[#111111] hover:underline font-semibold flex items-center gap-1 cursor-pointer disabled:opacity-50"
               >
                 <Upload className="w-3 h-3" />
-                <span>Add Angle Photo</span>
+                <span>Upload Angle Photo</span>
               </button>
             )}
             <input
               ref={galleryInputRef}
               type="file"
-              accept="image/*"
+              accept="image/png,image/jpeg,image/webp,image/avif"
               className="hidden"
               onChange={(e) => {
                 const files = e.target.files;
@@ -375,18 +429,51 @@ export const ImageUploadField: React.FC<ImageUploadFieldProps> = ({
           </div>
 
           {galleryImages.length > 0 && (
-            <div className="flex flex-wrap gap-2">
+            <div className="flex flex-wrap gap-2.5 pt-1">
               {galleryImages.map((gImg, gIdx) => (
-                <div key={gIdx} className="relative group w-14 h-18 border border-[#E5E5E5] bg-neutral-100 overflow-hidden">
+                <div
+                  key={gIdx}
+                  className="relative group w-16 h-20 border border-[#E5E5E5] bg-neutral-100 overflow-hidden"
+                >
                   <img src={gImg} alt={`Angle ${gIdx + 1}`} className="w-full h-full object-cover" />
-                  <button
-                    type="button"
-                    onClick={() => onGalleryChange(galleryImages.filter((_, i) => i !== gIdx))}
-                    className="absolute top-0.5 right-0.5 bg-black/80 text-white p-0.5 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
-                    title="Remove angle"
-                  >
-                    <X className="w-2.5 h-2.5" />
-                  </button>
+
+                  {/* Ordering and remove overlay controls */}
+                  <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-between p-1">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[9px] text-white font-mono">{gIdx + 1}</span>
+                      <button
+                        type="button"
+                        onClick={() => onGalleryChange(galleryImages.filter((_, i) => i !== gIdx))}
+                        className="text-white hover:text-red-400 cursor-pointer p-0.5"
+                        title="Remove photo"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+
+                    <div className="flex items-center justify-center gap-1">
+                      {gIdx > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => moveGalleryImage(gIdx, 'up')}
+                          className="p-0.5 bg-white/20 hover:bg-white text-black hover:text-black rounded-xs text-[10px] cursor-pointer"
+                          title="Move earlier"
+                        >
+                          <ArrowUp className="w-3 h-3 text-white hover:text-black" />
+                        </button>
+                      )}
+                      {gIdx < galleryImages.length - 1 && (
+                        <button
+                          type="button"
+                          onClick={() => moveGalleryImage(gIdx, 'down')}
+                          className="p-0.5 bg-white/20 hover:bg-white text-black hover:text-black rounded-xs text-[10px] cursor-pointer"
+                          title="Move later"
+                        >
+                          <ArrowDown className="w-3 h-3 text-white hover:text-black" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 </div>
               ))}
             </div>
